@@ -1,0 +1,6 @@
+models/
+results/
+data/
+slurm-*.out
+__pycache__/
+run.sh
