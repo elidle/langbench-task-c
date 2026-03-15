@@ -112,9 +112,6 @@ def finetune_mlqa(model_name: str, language: str, resume_step: int = None):
         training_args.weight_decay = 0.01
         training_args.warmup_ratio = 0.1
 
-        # training_args.eval_steps = 40
-        # training_args.save_steps = 40
-
         training_args.fp16 = True
 
     trainer = Trainer(
@@ -125,6 +122,7 @@ def finetune_mlqa(model_name: str, language: str, resume_step: int = None):
 
     trainer.train()
 
+    trainer.save_model(f"models/mlqa/{model_name}/{language}")
     tokenizer.save_pretrained(f"models/mlqa/{model_name}/{language}")
 
 
@@ -132,7 +130,7 @@ def evaluate_mlqa(model_name: str, language: str):
     results = {
         'task_lang': [],
         'transfer_lang': [],
-        'accuracy': [],
+        'exact_match': [],
         'f1_score': []
     }
 
@@ -200,7 +198,7 @@ def evaluate_mlqa(model_name: str, language: str):
 
         final_predictions = {}
 
-        for example in dataset:
+        for example in dataset["validation"]:
             example_id = example["id"]
             feature_indices = example_to_features[example_id]
 
@@ -239,19 +237,19 @@ def evaluate_mlqa(model_name: str, language: str):
 
         references = [
             {"id": ex["id"], "answers": ex["answers"]}
-            for ex in raw_dataset
+            for ex in dataset["validation"]
         ]
 
         metric = evaluate.load("squad")
-        results = metric.compute(
+        metric_scores = metric.compute(
             predictions=formatted_predictions,
             references=references,
         )
 
         results['task_lang'].append(task_lang)
         results['transfer_lang'].append(language)
-        results['accuracy'].append(metrics['overall_accuracy'])
-        results['f1_score'].append(macro_f1)
+        results['exact_match'].append(metric_scores['exact_match'])
+        results['f1_score'].append(metric_scores['f1'])
 
         df_results = pd.DataFrame(results)
 
