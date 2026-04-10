@@ -18,16 +18,25 @@ import os
 from tqdm import tqdm
 import torch
 
-LLAMA3_MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
-
-LLAMA3_LORA_CONFIG = LoraConfig(
-    task_type=TaskType.CAUSAL_LM,
-    r=16,
-    lora_alpha=32,
-    lora_dropout=0.05,
-    bias="none",
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+from transformers import (
+    AutoModelForSequenceClassification,
+    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    Trainer,
+    TrainingArguments,
+    DataCollatorWithPadding,
+    DataCollatorForSeq2Seq,
+    EarlyStoppingCallback,
 )
+from peft import LoraConfig, get_peft_model, TaskType, PeftModel
+import evaluate
+from argparse import ArgumentParser
+from datasets import load_dataset, load_from_disk, DatasetDict
+import pandas as pd
+import os
+from tqdm import tqdm
+import torch
 
 def flatten_to_lang(batch, lang, model):
     if model == "xlm-r":
@@ -172,13 +181,21 @@ def finetune_xnli(model_name: str, language: str, resume_step: int = None):
             predictions = predictions.argmax(axis=-1)
         
         elif model_name == "mt5":
-            decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+            # predictions can be tuple, logits, or token ids
+            if isinstance(predictions, tuple):
+                predictions = predictions[0]
+
+            # If logits were returned instead of generated tokens
+            if predictions.ndim == 3:
+                predictions = predictions.argmax(axis=-1)
+
+            decoded_preds = tokenizer.batch_decode(predictions.tolist(), skip_special_tokens=True)
 
             labels = [[l for l in label if l != -100] for label in labels]
             decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-            predictions = [label_to_id.get(p.strip(), -1) for p in decoded_preds]
-            labels = [label_to_id.get(l.strip(), -1) for l in decoded_labels]
+            predictions = [label_to_id.get(p.strip().lower(), -1) for p in decoded_preds]
+            labels = [label_to_id.get(l.strip().lower(), -1) for l in decoded_labels]
 
         elif model_name == "llama3":
             decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
@@ -210,8 +227,8 @@ def finetune_xnli(model_name: str, language: str, resume_step: int = None):
         training_args.weight_decay = 0.01
         training_args.warmup_ratio = 0.1
 
-        training_args.eval_steps = 5000
-        training_args.save_steps = 5000
+        training_args.eval_steps = 1500
+        training_args.save_steps = 1500
 
         training_args.fp16 = True
 
@@ -221,9 +238,11 @@ def finetune_xnli(model_name: str, language: str, resume_step: int = None):
         training_args.per_device_train_batch_size = 8
         training_args.per_device_eval_batch_size  = 8
         training_args.gradient_accumulation_steps = 4
+        training_args.eval_accumulation_steps = 16
         training_args.weight_decay = 0.01
         training_args.warmup_ratio = 0.1
         training_args.predict_with_generate = True
+        training_args.generation_max_new_tokens = 10
 
         training_args.eval_steps = 5000
         training_args.save_steps = 5000
@@ -352,7 +371,18 @@ def evaluate_xnli(model_name: str, language: str):
         accuracy = evaluate.load("accuracy")
         f1 = evaluate.load("f1")
 
-        trainer = Trainer(model=model, data_collator=data_collator)
+        training_args = TrainingArguments()
+
+        if model == "mt5":
+            training_args.predict_with_generate = True
+            training_args.generation_max_new_tokens = 10
+            training_args.per_device_eval_batch_size = 2
+
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            data_collator=data_collator
+        )
 
         predictions_output = trainer.predict(test_ds)
         predictions = predictions_output.predictions

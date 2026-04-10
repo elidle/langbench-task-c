@@ -23,7 +23,7 @@ def _filter_by_language(dataset, language: str):
 
 
 def _extract_languages(dataset):
-    # LANGUAGES_LIST = ['arabic', 'bengali', 'english', 'finnish', 'indonesian', 'korean', 'russian','swahili', 'telugu']
+    # LANGUAGES_LIST = ['arabic', 'bengali', 'english', 'finnish', 'indonesian', 'korean', 'russian', 'swahili', 'telugu']
     languages = set()
     for example in dataset:
         if "id" in example and isinstance(example["id"], str):
@@ -76,7 +76,6 @@ def finetune_tydiqa(model_name: str, language: str, resume_step: int = None):
 
                 sequence_ids = inputs.sequence_ids(i)
 
-                # Find context start and end
                 idx = 0
                 while sequence_ids[idx] != 1:
                     idx += 1
@@ -105,6 +104,79 @@ def finetune_tydiqa(model_name: str, language: str, resume_step: int = None):
         inputs["end_positions"] = end_positions
 
         return inputs
+        
+    def preprocess_validation(examples):
+        questions = [q.strip() for q in examples["question"]]
+        inputs = tokenizer(
+            questions,
+            examples["context"],
+            max_length=384,
+            truncation="only_second",
+            stride=128,
+            return_overflowing_tokens=True,
+            return_offsets_mapping=True,
+            padding="max_length",
+        )
+        sample_mapping = inputs.pop("overflow_to_sample_mapping")
+        offset_mapping = inputs["offset_mapping"]
+        example_ids = []
+        for i in range(len(inputs["input_ids"])):
+            sample_idx = sample_mapping[i]
+            example_ids.append(examples["id"][sample_idx])
+            sequence_ids = inputs.sequence_ids(i)
+            inputs["offset_mapping"][i] = [
+                o if sequence_ids[k] == 1 else None
+                for k, o in enumerate(offset_mapping[i])
+            ]
+        inputs["example_id"] = example_ids
+        return inputs
+
+    eval_dataset_raw = _filter_by_language(dataset["validation"], language)
+    eval_features = eval_dataset_raw.map(
+        preprocess_validation,
+        batched=True,
+        remove_columns=eval_dataset_raw.column_names
+    )
+    eval_features_no_id = eval_features.remove_columns(["example_id", "offset_mapping"])
+
+    def compute_metrics(pred):
+        try:
+            start_logits, end_logits = pred.predictions
+
+            example_to_features = collections.defaultdict(list)
+            for idx, feature in enumerate(eval_features):
+                example_to_features[feature["example_id"]].append(idx)
+
+            final_predictions = {}
+            for example in eval_dataset_raw:
+                example_id = example["id"]
+                best_score = -1e9
+                best_answer = ""
+                for idx in example_to_features[example_id]:
+                    offsets = eval_features[idx]["offset_mapping"]
+                    start_indexes = np.argsort(start_logits[idx])[-20:]
+                    end_indexes = np.argsort(end_logits[idx])[-20:]
+                    for start in start_indexes:
+                        for end in end_indexes:
+                            if offsets[start] is None or offsets[end] is None:
+                                continue
+                            if end < start or end - start > 30:
+                                continue
+                            score = start_logits[idx][start] + end_logits[idx][end]
+                            if score > best_score:
+                                best_answer = example["context"][offsets[start][0]:offsets[end][1]]
+                                best_score = score
+                final_predictions[example_id] = best_answer
+
+            metric = evaluate.load("squad")
+            metric_scores = metric.compute(
+                predictions=[{"id": k, "prediction_text": v} for k, v in final_predictions.items()],
+                references=[{"id": ex["id"], "answers": ex["answers"]} for ex in eval_dataset_raw],
+            )
+            return {"f1": metric_scores["f1"], "exact_match": metric_scores["exact_match"]}
+        except Exception as e:
+            print(f"compute_metrics failed: {e}")
+            raise  # re-raise so training fails loudly instead of silently
 
     tokenized_dataset = train_dataset.map(
         preprocess,
@@ -115,25 +187,31 @@ def finetune_tydiqa(model_name: str, language: str, resume_step: int = None):
     training_args = TrainingArguments(
         output_dir=f"models/tydiqa/{model_name}/{language}",
         logging_dir=f"logs/tydiqa/{model_name}/{language}",
+
+        eval_strategy="epoch",
         save_strategy="epoch",
-        save_total_limit=5
+        metric_for_best_model="f1",
+        greater_is_better=True,
+        load_best_model_at_end=True,
+        save_total_limit=2,
     )
 
     if model_name == "xlm-r":
-        training_args.num_train_epochs = 2
+        training_args.num_train_epochs = 10
         training_args.learning_rate = 3e-5
         training_args.per_device_train_batch_size = 16
         training_args.per_device_eval_batch_size = 16
-
         training_args.weight_decay = 0.01
         training_args.warmup_ratio = 0.1
-
         training_args.fp16 = True
 
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_dataset
+        train_dataset=tokenized_dataset,
+        eval_dataset=eval_features_no_id,
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]
     )
 
     trainer.train()

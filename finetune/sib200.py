@@ -12,25 +12,19 @@ from datasets import load_dataset, load_from_disk, DatasetDict
 import pandas as pd
 import os
 from tqdm import tqdm
-from utils import evaluate_model
+
+SIB_LABELS = ['science/technology', 'travel', 'politics', 'sports', 'health', 'entertainment', 'geography']
+label2id = {label: idx for idx, label in enumerate(SIB_LABELS)}
+id2label = {idx: label for label, idx in label2id.items()}
 
 
 def finetune_sib200(model_name: str, language: str):
-    labels = ['science/technology', 'travel', 'politics', 'sports', 'health', 'entertainment', 'geography']
-    label2id = {label: idx for idx, label in enumerate(labels)}
-    id2label = {idx: label for label, idx in label2id.items()}
-
-    dataset = load_dataset('Davlan/sib200', language)
+    # dataset = load_dataset('Davlan/sib200', language)
+    dataset = load_from_disk(f'data/sib200/{language}')
 
     if model_name == "xlm-r":
-        model = AutoModelForSequenceClassification.from_pretrained("xlm-roberta-base", num_labels=len(labels))
+        model = AutoModelForSequenceClassification.from_pretrained("xlm-roberta-base", num_labels=len(SIB_LABELS))
         tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
-    elif model_name == "mt5":
-        # TODO
-        pass
-    elif model_name == "llama3":
-        # TODO
-        pass
 
     def encode_labels(example):
         example["label"] = label2id[example["category"]]
@@ -99,15 +93,12 @@ def evaluate_sib200(model_name: str, language: str):
     for folder in os.listdir('data/sib200'):
         languages.add(folder)
 
-    labels = ['science/technology', 'travel', 'politics', 'sports', 'health', 'entertainment', 'geography']
-    label2id = {label: idx for idx, label in enumerate(labels)}
-
-    model = AutoModelForSequenceClassification.from_pretrained(f'models/sib200/{model_name}/{language}', num_labels=len(labels))
+    model = AutoModelForSequenceClassification.from_pretrained(f'models/sib200/{model_name}/{language}', num_labels=len(SIB_LABELS))
     tokenizer = AutoTokenizer.from_pretrained(f'models/sib200/{model_name}/{language}')
 
     test_datasets = {}
     for task_lang in languages:
-        test_datasets[task_lang] = load_from_disk(f'sib200/{task_lang}')['test']
+        test_datasets[task_lang] = load_from_disk(f'data/sib200/{task_lang}')['test']
 
         def encode_labels(example):
             example["label"] = label2id[example["category"]]
@@ -116,17 +107,35 @@ def evaluate_sib200(model_name: str, language: str):
         test_datasets[task_lang] = DatasetDict({'test': test_datasets[task_lang].map(encode_labels, num_proc=4)})
     
     for task_lang in tqdm(languages):
-        transfer_results = evaluate_model(
-            dataset=test_datasets[task_lang],
-            model=model,
-            tokenizer=tokenizer,
-            task_lang=task_lang,
-            transfer_lang=language
-        )
+        # transfer_results = evaluate_model(
+        #     dataset=test_datasets[task_lang],
+        #     model=model,
+        #     tokenizer=tokenizer,
+        #     task_lang=task_lang,
+        #     transfer_lang=language
+        # )
+
+        def tokenize_function(examples):
+            return tokenizer(examples['text'], padding='max_length', truncation=True, max_length=256)
+
+        tokenized_datasets = test_datasets[task_lang]['test'].map(tokenize_function,batched=True)
+
+        trainer = Trainer(model=model)
+        
+        predictions = trainer.predict(tokenized_datasets)
+        preds = predictions.predictions.argmax(axis=-1)
+        labels = tokenized_datasets['label']
+
+        accuracy = evaluate.load('accuracy')
+        f1 = evaluate.load('f1')
+
+        accuracy = accuracy.compute(predictions=preds, references=labels)
+        f1_score = f1.compute(predictions=preds, references=labels, average='macro')
+
         results['task_lang'].append(task_lang)
         results['transfer_lang'].append(language)
-        results['accuracy'].append(transfer_results['accuracy'])
-        results['f1_score'].append(transfer_results['f1_score'])
+        results['accuracy'].append(accuracy['accuracy'])
+        results['f1_score'].append(f1_score['f1'])
 
         df_results = pd.DataFrame(results)
 
@@ -141,12 +150,17 @@ if __name__ == "__main__":
 
     parser.add_argument('--lang', type=str, required=True,
                         help='Language to fine-tune the model on. Must follow the convention in SIB200.')
-    parser.add_argument('--model', type=str, required=True, choices=('xlm-r', 'mt5', 'llama3'),
+    parser.add_argument('--model', type=str, required=True, choices=('xlm-r',),
                         help='Model to fine-tune')
+    parser.add_argument('--eval_only', action='store_true',
+                            help="Skip training and directly load finetuned model for evaluation")
+    # parser.add_argument('--resume_step', type=int, default=None,
+    #                     help="Resume training from checkpoint step number")
     args = parser.parse_args()
 
     # Fine-tune model on transfer language
-    finetune_sib200(args.model, args.lang)
+    if not args.eval_only:
+        finetune_sib200(args.model, args.lang)
 
     # Evaluate fine-tuned model on all other languages in the dataset
     evaluate_sib200(args.model, args.lang)

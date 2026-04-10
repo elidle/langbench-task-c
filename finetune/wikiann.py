@@ -7,13 +7,12 @@ from transformers import (
     EarlyStoppingCallback,
 )
 import evaluate
-import tempfile
 from argparse import ArgumentParser
-from datasets import load_dataset, load_from_disk, DatasetDict
+from datasets import load_from_disk
 import pandas as pd
 import os
 from tqdm import tqdm
-import torch
+from functools import partial
 
 evaluate.config.CACHE_DIRECTORY = "/tmp/evaluate_cache"
 
@@ -21,113 +20,115 @@ label_list = ["O", "B-PER", "I-PER", "B-ORG", "I-ORG", "B-LOC", "I-LOC"]
 label_to_id = {l: i for i, l in enumerate(label_list)}
 id_to_label = {i: l for i, l in enumerate(label_list)}
 
+seqeval = evaluate.load("seqeval")
+
+EPOCHS = 10
+LEARNING_RATE = 3e-5
+BATCH_SIZE = 32
+WEIGHT_DECAY = 0.01
+WARMUP_RATIO = 0.1
+STEPS = 500
+PATIENCE = 5
+
+def preprocess(examples, tokenizer):
+    tokenized = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True)
+    all_labels = []
+    for i, labels in enumerate(examples["ner_tags"]):
+        word_ids = tokenized.word_ids(batch_index=i)
+        prev_word_id = None
+
+        aligned = []
+        for word_id in word_ids:
+            if word_id is None:
+                aligned.append(-100)
+            elif word_id != prev_word_id:
+                aligned.append(labels[word_id])
+            else:
+                aligned.append(-100)
+            prev_word_id = word_id
+        
+        all_labels.append(aligned)
+    tokenized["labels"] = all_labels
+    return tokenized
+
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    predictions = predictions.argmax(axis=-1)
+
+    true_preds = [[id_to_label[p] for p, l in zip(pred_row, label_row) if l != -100]
+                for pred_row, label_row in zip(predictions, labels)]
+    true_labels = [[id_to_label[l] for l in label_row if l != -100]
+                for label_row in labels]
+
+    metrics = seqeval.compute(predictions=true_preds, references=true_labels)
+
+    macro_f1 = calculate_macro_f1(metrics)
+    return {
+        "f1": macro_f1,
+        "accuracy": metrics["overall_accuracy"]
+    }
+
 def calculate_macro_f1(metrics):
     """Calculate macro f1 from seqeval results"""
     type_f1s = [metrics[etype]["f1"] for etype in metrics if isinstance(metrics[etype], dict)]
     macro_f1 = sum(type_f1s) / len(type_f1s)
     return macro_f1
 
-def finetune_wikiann(model_name: str, language: str, resume_step: int = None):
-    dataset = load_from_disk(f'data/wikiann/{language}')
+def finetune_wikiann(language: str):
+    model = AutoModelForTokenClassification.from_pretrained("xlm-roberta-base", num_labels=len(label_list), id2label=id_to_label, label2id=label_to_id)
+    tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
 
-    if model_name == "xlm-r":
-        model = AutoModelForTokenClassification.from_pretrained("xlm-roberta-base", num_labels=len(label_list), id2label=id_to_label, label2id=label_to_id)
-        tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
+    train_dataset = load_from_disk(f'data/wikiann/{language}')["train"]
+    eval_dataset = load_from_disk(f'data/wikiann/{language}')["validation"]
 
-        data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
+    preprocess_fn = partial(preprocess, tokenizer=tokenizer)
+    train_dataset = train_dataset.map(preprocess_fn, batched=True, remove_columns=train_dataset.column_names)
+    eval_dataset  = eval_dataset.map(preprocess_fn, batched=True, remove_columns=eval_dataset.column_names)
 
-    def tokenize_and_align_labels(examples):
-        tokenized = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True)
-        all_labels = []
-        for i, labels in enumerate(examples["ner_tags"]):
-            word_ids = tokenized.word_ids(batch_index=i)
-            prev_word_id = None
-
-            aligned = []
-            for word_id in word_ids:
-                if word_id is None: # Special tokens
-                    aligned.append(-100)
-                elif word_id != prev_word_id: # First sub-token
-                    aligned.append(labels[word_id])
-                else: # Subsequent sub-token
-                    aligned.append(-100)
-                prev_word_id = word_id
-            
-            all_labels.append(aligned)
-        tokenized["labels"] = all_labels
-        return tokenized
-    
-    tokenized_dataset = dataset.map(
-        tokenize_and_align_labels,
-        batched=True,
-        remove_columns=dataset["train"].column_names,
-    )
-
-    seqeval = evaluate.load("seqeval")
-
-    def compute_metrics(eval_pred):
-        predictions, labels = eval_pred
-        predictions = predictions.argmax(axis=-1)
-
-        true_preds = [[id_to_label[p] for p, l in zip(pred_row, label_row) if l != -100]
-                    for pred_row, label_row in zip(predictions, labels)]
-        true_labels = [[id_to_label[l] for l in label_row if l != -100]
-                    for label_row in labels]
-
-        metrics = seqeval.compute(predictions=true_preds, references=true_labels)
-
-        macro_f1 = calculate_macro_f1(metrics)
-        return {
-            "f1": macro_f1,
-            "accuracy": metrics["overall_accuracy"]
-        }
+    data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
 
     training_args = TrainingArguments(
-        output_dir=f"models/wikiann/{model_name}/{language}",
-        logging_dir=f"logs/wikiann/{model_name}/{language}",
+        output_dir=f"models/wikiann/xlm-r/{language}",
+
         eval_strategy="steps",
         save_strategy="steps",
+
         metric_for_best_model="eval_f1",
+
         greater_is_better=True,
         load_best_model_at_end=True,
-        save_total_limit=5
+        save_total_limit=2,
+
+        num_train_epochs=EPOCHS,
+        learning_rate=LEARNING_RATE,
+        per_device_train_batch_size=BATCH_SIZE,
+        per_device_eval_batch_size=BATCH_SIZE,
+
+        weight_decay = 0.01,
+        warmup_ratio = 0.1,
+
+        eval_steps = 300,
+        save_steps = 300
     )
-
-    if model_name == "xlm-r":
-        training_args.num_train_epochs = 5
-        training_args.learning_rate = 2e-5
-        training_args.per_device_train_batch_size = 16
-        training_args.per_device_eval_batch_size  = 16
-
-        training_args.weight_decay = 0.01
-        training_args.warmup_ratio = 0.1
-
-        training_args.eval_steps = 300
-        training_args.save_steps = 300
-
-        training_args.fp16 = True
 
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_dataset["train"],
-        eval_dataset=tokenized_dataset["validation"],
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=PATIENCE)]
     )
 
     trainer.train()
+    
+    trainer.save_model(f"models/wikiann/xlm-r/{language}")
 
-    if model_name == "llama3":
-        model.save_pretrained(f"models/wikiann/{model_name}/{language}")
-    else:
-        trainer.save_model(f"models/wikiann/{model_name}/{language}")
-
-    tokenizer.save_pretrained(f"models/wikiann/{model_name}/{language}")
+    tokenizer.save_pretrained(f"models/wikiann/xlm-r/{language}")
 
 
-def evaluate_wikiann(model_name: str, language: str):
+def evaluate_wikiann(language: str):
     results = {
         'task_lang': [],
         'transfer_lang': [],
@@ -140,70 +141,32 @@ def evaluate_wikiann(model_name: str, language: str):
     for folder in os.listdir('data/wikiann'):
         languages.add(folder)
 
-    if model_name == "xlm-r":
-        model = AutoModelForTokenClassification.from_pretrained(f'models/wikiann/{model_name}/{language}')
-        tokenizer = AutoTokenizer.from_pretrained(f'models/wikiann/{model_name}/{language}')
+    model = AutoModelForTokenClassification.from_pretrained(f'models/wikiann/xlm-r/{language}')
+    tokenizer = AutoTokenizer.from_pretrained(f'models/wikiann/xlm-r/{language}')
 
-    def tokenize_and_align_labels(examples):
-        tokenized = tokenizer(examples["tokens"], truncation=True, is_split_into_words=True)
-        all_labels = []
-        for i, labels in enumerate(examples["ner_tags"]):
-            word_ids = tokenized.word_ids(batch_index=i)
-            prev_word_id = None
+    data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
 
-            aligned = []
-            for word_id in word_ids:
-                if word_id is None: # Special tokens
-                    aligned.append(-100)
-                elif word_id != prev_word_id: # First sub-token
-                    aligned.append(labels[word_id])
-                else: # Subsequent sub-token
-                    aligned.append(-100)
-                prev_word_id = word_id
-            
-            all_labels.append(aligned)
-        tokenized["labels"] = all_labels
-        return tokenized
-    
-    seqeval = evaluate.load("seqeval")
+    trainer = Trainer(model=model, data_collator=data_collator, compute_metrics=compute_metrics)
+
+    preprocess_fn = partial(preprocess, tokenizer=tokenizer)
 
     for task_lang in tqdm(languages):
-        dataset = load_from_disk(f'data/wikiann/{task_lang}')
+        test_dataset = load_from_disk(f'data/wikiann/{task_lang}')["test"]
+        test_dataset = test_dataset.map(preprocess_fn, batched=True, remove_columns=test_dataset.column_names)
 
-        if model_name == "xlm-r":
-            test_ds = dataset["test"].map(
-                tokenize_and_align_labels,
-                batched=True,
-                remove_columns=dataset["test"].column_names
-            )
+        predictions_output = trainer.predict(test_dataset)
 
-            data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
-
-        trainer = Trainer(model=model, data_collator=data_collator)
-
-        predictions_output = trainer.predict(test_ds)
-        predictions = predictions_output.predictions
-        labels = predictions_output.label_ids
-
-        if model_name == "xlm-r":
-            predictions = predictions.argmax(axis=-1)
-
-        true_preds = [[id_to_label[p] for p, l in zip(pred_row, label_row) if l != -100]
-                    for pred_row, label_row in zip(predictions, labels)]
-        true_labels = [[id_to_label[l] for l in label_row if l != -100]
-                    for label_row in labels]
-
-        metrics = seqeval.compute(predictions=true_preds, references=true_labels)
-        macro_f1 = calculate_macro_f1(metrics)
+        acc_score = predictions_output.metrics['test_accuracy']
+        f1_score  = predictions_output.metrics['test_f1']
 
         results['task_lang'].append(task_lang)
         results['transfer_lang'].append(language)
-        results['accuracy'].append(metrics['overall_accuracy'])
-        results['f1_score'].append(macro_f1)
+        results['accuracy'].append(acc_score)
+        results['f1_score'].append(f1_score)
 
         df_results = pd.DataFrame(results)
 
-        output_dir = f'results/wikiann/{model_name}'
+        output_dir = f'results/wikiann/xlm-r'
         os.makedirs(output_dir, exist_ok=True)
 
         df_results.to_csv(f'{output_dir}/{language}.csv', index=False)
@@ -214,19 +177,19 @@ if __name__ == "__main__":
 
     parser.add_argument('--lang', type=str, required=True,
                         help='Language to fine-tune the model on. Must follow the convention in WikiAnn.')
-    parser.add_argument('--model', type=str, required=True, choices=('xlm-r', 'mt5', 'llama3'),
-                        help='Model to fine-tune')
+    # parser.add_argument('--model', type=str, required=True, choices=('xlm-r', 'mt5', 'llama3'),
+    #                     help='Model to fine-tune')
     parser.add_argument('--eval_only', action='store_true',
                         help="Skip training and directly load finetuned model for evaluation")
-    parser.add_argument('--resume_step', type=int, default=None,
-                        help="Resume training from checkpoint step number")
+    # parser.add_argument('--resume_step', type=int, default=None,
+    #                     help="Resume training from checkpoint step number")
     args = parser.parse_args()
 
-    print(f"Processing model {args.model} and language {args.lang} on WikiAnn dataset...")
+    print(f"Processing XLM-R and language {args.lang} on WikiAnn dataset...")
 
     # Fine-tune model on transfer language
     if not args.eval_only:
-        finetune_wikiann(args.model, args.lang)
+        finetune_wikiann(args.lang)
 
     # Evaluate fine-tuned model on all other languages in the dataset
-    evaluate_wikiann(args.model, args.lang)
+    evaluate_wikiann(args.lang)
