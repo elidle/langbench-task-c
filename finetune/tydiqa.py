@@ -139,45 +139,6 @@ def finetune_tydiqa(model_name: str, language: str, resume_step: int = None):
     )
     eval_features_no_id = eval_features.remove_columns(["example_id", "offset_mapping"])
 
-    def compute_metrics(pred):
-        try:
-            start_logits, end_logits = pred.predictions
-
-            example_to_features = collections.defaultdict(list)
-            for idx, feature in enumerate(eval_features):
-                example_to_features[feature["example_id"]].append(idx)
-
-            final_predictions = {}
-            for example in eval_dataset_raw:
-                example_id = example["id"]
-                best_score = -1e9
-                best_answer = ""
-                for idx in example_to_features[example_id]:
-                    offsets = eval_features[idx]["offset_mapping"]
-                    start_indexes = np.argsort(start_logits[idx])[-20:]
-                    end_indexes = np.argsort(end_logits[idx])[-20:]
-                    for start in start_indexes:
-                        for end in end_indexes:
-                            if offsets[start] is None or offsets[end] is None:
-                                continue
-                            if end < start or end - start > 30:
-                                continue
-                            score = start_logits[idx][start] + end_logits[idx][end]
-                            if score > best_score:
-                                best_answer = example["context"][offsets[start][0]:offsets[end][1]]
-                                best_score = score
-                final_predictions[example_id] = best_answer
-
-            metric = evaluate.load("squad")
-            metric_scores = metric.compute(
-                predictions=[{"id": k, "prediction_text": v} for k, v in final_predictions.items()],
-                references=[{"id": ex["id"], "answers": ex["answers"]} for ex in eval_dataset_raw],
-            )
-            return {"f1": metric_scores["f1"], "exact_match": metric_scores["exact_match"]}
-        except Exception as e:
-            print(f"compute_metrics failed: {e}")
-            raise  # re-raise so training fails loudly instead of silently
-
     tokenized_dataset = train_dataset.map(
         preprocess,
         batched=True,
@@ -188,30 +149,25 @@ def finetune_tydiqa(model_name: str, language: str, resume_step: int = None):
         output_dir=f"models/tydiqa/{model_name}/{language}",
         logging_dir=f"logs/tydiqa/{model_name}/{language}",
 
-        eval_strategy="epoch",
+        # eval_strategy="epoch",
         save_strategy="epoch",
-        metric_for_best_model="f1",
-        greater_is_better=True,
-        load_best_model_at_end=True,
+        # greater_is_better=True,
+        # load_best_model_at_end=True,
         save_total_limit=2,
     )
 
     if model_name == "xlm-r":
-        training_args.num_train_epochs = 10
+        training_args.num_train_epochs = 3
         training_args.learning_rate = 3e-5
-        training_args.per_device_train_batch_size = 16
-        training_args.per_device_eval_batch_size = 16
-        training_args.weight_decay = 0.01
-        training_args.warmup_ratio = 0.1
-        training_args.fp16 = True
+        training_args.per_device_train_batch_size = 32
+        training_args.per_device_eval_batch_size = 32
 
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=tokenized_dataset,
-        eval_dataset=eval_features_no_id,
-        compute_metrics=compute_metrics,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]
+        eval_dataset=eval_features_no_id
+        # callbacks=[EarlyStoppingCallback(early_stopping_patience=5)]
     )
 
     trainer.train()

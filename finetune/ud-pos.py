@@ -99,8 +99,8 @@ def finetune_ud_pos(language: str):
     model = AutoModelForTokenClassification.from_pretrained("xlm-roberta-base", num_labels=len(UPOS_LABELS), id2label=id2label, label2id=label2id)
     tokenizer = AutoTokenizer.from_pretrained("xlm-roberta-base")
 
-    train_dataset = load_dataset('csv', data_files=f'data/ud-pos/{language}_train.csv')['train'].map(fix_columns)
-    eval_dataset  = load_dataset('csv', data_files=f'data/ud-pos/{language}_test.csv')['train'].map(fix_columns)
+    train_dataset = load_dataset('parquet', data_files=f'data/ud-pos/{language}_train.parquet')['train']
+    eval_dataset  = load_dataset('parquet', data_files=f'data/ud-pos/{language}_test.parquet')['train']
     train_dataset = fix_samples(train_dataset, NUM_SAMPLES)
 
     preprocess_fn = partial(preprocess, tokenizer=tokenizer)
@@ -168,7 +168,7 @@ def evaluate_ud_pos(language: str):
     preprocess_fn = partial(preprocess, tokenizer=tokenizer)
 
     for task_lang in tqdm(languages):
-        test_dataset = load_dataset('csv', data_files=f'data/ud-pos/{task_lang}_test.csv')['train'].map(fix_columns)
+        test_dataset = load_dataset('parquet', data_files=f'data/ud-pos/{task_lang}_test.parquet')['train']
         test_dataset = test_dataset.map(preprocess_fn, batched=True)
 
         predictions_output = trainer.predict(test_dataset)

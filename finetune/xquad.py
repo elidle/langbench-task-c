@@ -104,15 +104,10 @@ def finetune_xquad(model_name: str, language: str, resume_step: int = None):
     )
 
     if model_name == "xlm-r":
-        training_args.num_train_epochs = 2
+        training_args.num_train_epochs = 3
         training_args.learning_rate = 3e-5
-        training_args.per_device_train_batch_size = 16
-        training_args.per_device_eval_batch_size = 16
-
-        training_args.weight_decay = 0.01
-        training_args.warmup_ratio = 0.1
-
-        training_args.fp16 = True
+        training_args.per_device_train_batch_size = 32
+        training_args.per_device_eval_batch_size = 32
 
     trainer = Trainer(
         model=model,
